@@ -23,10 +23,10 @@ cpuprofile: fmt
 	@go test -c
 	@./bolt.test -test.v -test.run=$(TEST) -test.cpuprofile cpu.prof
 
-# go get github.com/kisielk/errcheck
+# go get github.com/dvln/errcheck
 errcheck:
 	@echo "=== errcheck ==="
-	@errcheck github.com/boltdb/bolt
+	@errcheck github.com/dvln/bolt
 
 fmt:
 	@go fmt ./...
@@ -39,7 +39,7 @@ build: get
 	@go build -ldflags=$(GOLDFLAGS) -a -o bin/bolt ./cmd/bolt
 
 test: fmt
-	@go get github.com/stretchr/testify/assert
+	@go get github.com/dvln/testify/assert
 	@echo "=== TESTS ==="
 	@go test -v -cover -test.run=$(TEST)
 	@echo ""

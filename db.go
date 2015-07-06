@@ -104,6 +104,10 @@ type DB struct {
 	ops struct {
 		writeAt func(b []byte, off int64) (n int, err error)
 	}
+
+	// Read only mode.
+	// When true, Update() and Begin(true) return ErrDatabaseReadOnly immediately.
+	readOnly bool
 }
 
 // Path returns the path to currently open database file.
@@ -137,19 +141,28 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 	db.MaxBatchSize = DefaultMaxBatchSize
 	db.MaxBatchDelay = DefaultMaxBatchDelay
 
+	flag := os.O_RDWR
+	if options.ReadOnly {
+		flag = os.O_RDONLY
+		db.readOnly = true
+	}
+
 	// Open data file and separate sync handler for metadata writes.
 	db.path = path
-
 	var err error
-	if db.file, err = os.OpenFile(db.path, os.O_RDWR|os.O_CREATE, mode); err != nil {
+	if db.file, err = os.OpenFile(db.path, flag|os.O_CREATE, mode); err != nil {
 		_ = db.close()
 		return nil, err
 	}
 
-	// Lock file so that other processes using Bolt cannot use the database
-	// at the same time. This would cause corruption since the two processes
-	// would write meta pages and free pages separately.
-	if err := flock(db.file, options.Timeout); err != nil {
+	// Lock file so that other processes using Bolt in read-write mode cannot
+	// use the database  at the same time. This would cause corruption since
+	// the two processes would write meta pages and free pages separately.
+	// The database file is locked exclusively (only one process can grab the lock)
+	// if !options.ReadOnly.
+	// The database file is locked using the shared lock (more than one process may
+	// hold a lock at the same time) otherwise (options.ReadOnly is set).
+	if err := flock(db.file, !db.readOnly, options.Timeout); err != nil {
 		_ = db.close()
 		return nil, err
 	}
@@ -338,8 +351,15 @@ func (db *DB) init() error {
 // Close releases all database resources.
 // All transactions must be closed before closing the database.
 func (db *DB) Close() error {
+	db.rwlock.Lock()
+	defer db.rwlock.Unlock()
+
 	db.metalock.Lock()
 	defer db.metalock.Unlock()
+
+	db.mmaplock.RLock()
+	defer db.mmaplock.RUnlock()
+
 	return db.close()
 }
 
@@ -359,8 +379,11 @@ func (db *DB) close() error {
 
 	// Close file handles.
 	if db.file != nil {
-		// Unlock the file.
-		_ = funlock(db.file)
+		// No need to unlock read-only file.
+		if !db.readOnly {
+			// Unlock the file.
+			_ = funlock(db.file)
+		}
 
 		// Close the file descriptor.
 		if err := db.file.Close(); err != nil {
@@ -377,6 +400,11 @@ func (db *DB) close() error {
 // write transaction can be used at a time. Starting multiple write transactions
 // will cause the calls to block and be serialized until the current write
 // transaction finishes.
+//
+// Transactions should not be depedent on one another. Opening a read
+// transaction and a write transaction in the same goroutine can cause the
+// writer to deadlock because the database periodically needs to re-mmap itself
+// as it grows and it cannot do that while a read transaction is open.
 //
 // IMPORTANT: You must close read-only transactions after you are finished or
 // else the database will not reclaim old pages.
@@ -426,6 +454,11 @@ func (db *DB) beginTx() (*Tx, error) {
 }
 
 func (db *DB) beginRWTx() (*Tx, error) {
+	// If the database was opened with Options.ReadOnly, return an error.
+	if db.readOnly {
+		return nil, ErrDatabaseReadOnly
+	}
+
 	// Obtain writer lock. This is released by the transaction when it closes.
 	// This enforces only one writer transaction at a time.
 	db.rwlock.Lock()
@@ -622,6 +655,10 @@ func (db *DB) allocate(count int) (*page, error) {
 	return p, nil
 }
 
+func (db *DB) IsReadOnly() bool {
+	return db.readOnly
+}
+
 // Options represents the options that can be set when opening a database.
 type Options struct {
 	// Timeout is the amount of time to wait to obtain a file lock.
@@ -631,6 +668,10 @@ type Options struct {
 
 	// Sets the DB.NoGrowSync flag before memory mapping the file.
 	NoGrowSync bool
+
+	// Open database in read-only mode. Uses flock(..., LOCK_SH |LOCK_NB) to
+	// grab a shared lock (UNIX).
+	ReadOnly bool
 }
 
 // DefaultOptions represent the options used if nil options are passed into Open().
